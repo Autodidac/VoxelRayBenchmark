@@ -1,0 +1,52 @@
+Epoch voxel live ray inspector 0.6.1 source validation
+Date: 2026-07-28
+
+Validated in the available Linux container:
+
+PASS  JSON parsing
+      - CMakePresets.json
+      - vcpkg.json
+
+PASS  ray_inspector.cpp fallback syntax
+      - Clang C++23
+      - warnings enabled: -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+
+PASS  ray_inspector.cpp EpochGui path syntax
+      - Clang C++23
+      - C++23 module stubs for epoch.gui and epoch.gui.font
+      - warnings enabled: -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+
+PASS  OpenGL source + inspector fallback compile/link
+      - two translation units
+      - local SDL3/OpenGL API stubs
+
+PASS  OpenGL source + inspector EpochGui compile/link
+      - two translation units
+      - C++23 module stubs
+      - local SDL3/OpenGL API stubs
+
+PASS  owned-child source contract
+      - SDL_PROP_WINDOW_CREATE_PARENT_POINTER set before creation
+      - SDL_PROP_WINDOW_CREATE_UTILITY_BOOLEAN enabled
+      - SDL_CreateWindowWithProperties used
+      - SDL_GetWindowParent verifies ownership
+      - no SDL_SetWindowParent calls remain
+      - no dock sizing/synchronization APIs remain
+
+PASS  benchmark isolation
+      - main Vulkan/OpenGL presentation no longer reserves inspector width
+      - compute dimensions remain 1280x720
+      - shaders/trace.comp SHA-256 unchanged:
+        e7e74f5364abcf2be58c014f357fa0b0427c133400655b8eed5d6c634e468062
+
+PASS  shared-header two-translation-unit link behavior retained
+      - benchmark_common.hpp functions remain inline
+
+Not performed in this container:
+
+- Complete MSVC/Visual Studio build
+- Native SDL owned utility-child behavior on Win32
+- Vulkan runtime presentation
+- OpenGL runtime presentation
+- Actual EpochGui repository module build through MSVC
+- RTX 5080 runtime validation

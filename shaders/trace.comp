@@ -1,0 +1,785 @@
+#version 430
+
+#ifndef TRACE_BVH
+#define TRACE_BVH 0
+#endif
+
+#ifndef TRACE_VOXEL
+#define TRACE_VOXEL 0
+#endif
+
+#ifndef INSTRUMENT
+#define INSTRUMENT 0
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float kInfinity = 3.402823466e+38;
+const float kEpsilon = 1.0e-4;
+const uint kMaxDebugEvents = 256u;
+
+struct Triangle {
+    vec4 v0;
+    vec4 v1;
+    vec4 v2;
+    vec4 color;
+};
+
+struct BvhNode {
+    vec4 minimum;
+    vec4 maximum;
+    uvec4 meta; // left, right, first triangle reference, triangle count
+};
+
+struct BrickHeader {
+    uint nodeOffset;
+    uint nodeCount;
+    uint referenceOffset;
+    uint referenceCount;
+    vec4 volume; // rgb tint, alpha extinction density
+};
+
+struct TraversalConfig {
+    uint headerOffset;
+    uint brickSize;
+    uint brickDimensionX;
+    uint brickDimensionY;
+    uint brickDimensionZ;
+    uint rayMode;
+    uint variantIndex;
+    uint workloadMode; // 0 surface-only, 1 surface + sparse volume
+};
+
+struct DebugEvent {
+    vec4 positionT;
+    uvec4 data; // type, x/index, y/count, z/depth
+};
+
+layout(std430, binding = 0) readonly buffer TriangleBuffer {
+    Triangle triangles[];
+};
+
+layout(std430, binding = 1) readonly buffer BvhBuffer {
+    BvhNode bvhNodes[];
+};
+
+layout(std430, binding = 2) readonly buffer BvhReferenceBuffer {
+    uint bvhTriangleReferences[];
+};
+
+layout(std430, binding = 3) readonly buffer BrickHeaderBuffer {
+    BrickHeader brickHeaders[];
+};
+
+layout(std430, binding = 4) readonly buffer MicroBvhBuffer {
+    BvhNode microBvhNodes[];
+};
+
+layout(std430, binding = 5) readonly buffer MicroReferenceBuffer {
+    uint microTriangleReferences[];
+};
+
+layout(std430, binding = 6) buffer MetricBuffer {
+    uint metricValues[];
+};
+
+layout(std430, binding = 7) buffer DebugBuffer {
+    uint debugCount;
+    uint debugOverflow;
+    uvec2 debugPadding;
+    DebugEvent debugEvents[];
+};
+
+layout(binding = 8, rgba8) uniform writeonly image2D outputImage;
+
+layout(std430, binding = 9) readonly buffer TraversalConfigBuffer {
+    TraversalConfig traversalConfig;
+};
+
+#ifdef EPOCH_OPENGL
+layout(std140, binding = 10) uniform PushConstantsBlock {
+    vec4 cameraPosition;
+    vec4 cameraForward;
+    vec4 cameraRight;
+    vec4 cameraUp;
+    vec4 worldMinimum;
+    vec4 cellSize;
+    uvec4 imageMode;    // width, height, visualization, frame
+    uvec4 gridSelected; // grid x/y/z, selected pixel packed as yyyyxxxx
+} pushData;
+#else
+layout(push_constant) uniform PushConstants {
+    vec4 cameraPosition;
+    vec4 cameraForward;
+    vec4 cameraRight;
+    vec4 cameraUp;
+    vec4 worldMinimum;
+    vec4 cellSize;
+    uvec4 imageMode;    // width, height, visualization, frame
+    uvec4 gridSelected; // grid x/y/z, selected pixel packed as yyyyxxxx
+} pushData;
+#endif
+
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+};
+
+struct Hit {
+    float t;
+    uint triangleIndex;
+    vec3 normal;
+    vec3 color;
+    bool found;
+};
+
+struct LocalMetrics {
+    uint nodeTests;
+    uint brickSteps;
+    uint microNodeTests;
+    uint occupiedBricks;
+    uint triangleTests;
+    uint volumeSamples;
+    uint volumeBricks;
+    uint hits;
+    uint maximumTraversal;
+};
+
+struct DdaState {
+    ivec3 coordinate;
+    ivec3 step;
+    vec3 nextT;
+    vec3 deltaT;
+    float currentT;
+};
+
+shared uint workgroupMetrics[10];
+
+vec3 safeInverse(vec3 value) {
+    return vec3(
+        value.x >= 0.0 ? 1.0 / max(abs(value.x), 1.0e-20) : -1.0 / max(abs(value.x), 1.0e-20),
+        value.y >= 0.0 ? 1.0 / max(abs(value.y), 1.0e-20) : -1.0 / max(abs(value.y), 1.0e-20),
+        value.z >= 0.0 ? 1.0 / max(abs(value.z), 1.0e-20) : -1.0 / max(abs(value.z), 1.0e-20));
+}
+
+bool intersectAabb(Ray ray, vec3 minimum, vec3 maximum, float maximumT, out float nearT, out float farT) {
+    const vec3 inverseDirection = safeInverse(ray.direction);
+    const vec3 first = (minimum - ray.origin) * inverseDirection;
+    const vec3 second = (maximum - ray.origin) * inverseDirection;
+    const vec3 lower = min(first, second);
+    const vec3 upper = max(first, second);
+
+    nearT = max(max(lower.x, lower.y), max(lower.z, 0.0));
+    farT = min(min(upper.x, upper.y), min(upper.z, maximumT));
+    return nearT <= farT;
+}
+
+bool intersectTriangle(Ray ray, Triangle triangle, float maximumT, out float hitT, out vec3 normal) {
+    const vec3 edge1 = triangle.v1.xyz - triangle.v0.xyz;
+    const vec3 edge2 = triangle.v2.xyz - triangle.v0.xyz;
+    const vec3 p = cross(ray.direction, edge2);
+    const float determinant = dot(edge1, p);
+
+    if (abs(determinant) < 1.0e-8) {
+        return false;
+    }
+
+    const float inverseDeterminant = 1.0 / determinant;
+    const vec3 tVector = ray.origin - triangle.v0.xyz;
+    const float u = dot(tVector, p) * inverseDeterminant;
+    if (u < 0.0 || u > 1.0) {
+        return false;
+    }
+
+    const vec3 q = cross(tVector, edge1);
+    const float v = dot(ray.direction, q) * inverseDeterminant;
+    if (v < 0.0 || u + v > 1.0) {
+        return false;
+    }
+
+    hitT = dot(edge2, q) * inverseDeterminant;
+    if (hitT <= kEpsilon || hitT >= maximumT) {
+        return false;
+    }
+
+    normal = normalize(cross(edge1, edge2));
+    if (dot(normal, ray.direction) > 0.0) {
+        normal = -normal;
+    }
+    return true;
+}
+
+uint flatten3D(ivec3 coordinate, ivec3 dimensions) {
+    return uint(coordinate.x + dimensions.x * (coordinate.y + dimensions.y * coordinate.z));
+}
+
+bool insideGrid(ivec3 coordinate, ivec3 dimensions) {
+    return all(greaterThanEqual(coordinate, ivec3(0))) && all(lessThan(coordinate, dimensions));
+}
+
+uvec2 selectedPixel() {
+    return uvec2(pushData.gridSelected.w & 0xffffu, pushData.gridSelected.w >> 16u);
+}
+
+bool isSelectedRay(uvec2 pixel) {
+    return all(equal(pixel, selectedPixel()));
+}
+
+void recordDebug(bool enabled, uint type, vec3 position, float t, uvec3 data) {
+#if INSTRUMENT
+    if (!enabled) {
+        return;
+    }
+
+    const uint index = debugCount;
+    if (index < kMaxDebugEvents) {
+        debugEvents[index].positionT = vec4(position, t);
+        debugEvents[index].data = uvec4(type, data);
+        debugCount = index + 1u;
+    } else {
+        debugOverflow = 1u;
+    }
+#endif
+}
+
+DdaState initializeDda(Ray ray, float startT, vec3 gridMinimum, vec3 stepSize, ivec3 dimensions) {
+    DdaState state;
+    state.currentT = startT;
+
+    const vec3 position = ray.origin + ray.direction * (startT + kEpsilon);
+    state.coordinate = clamp(ivec3(floor((position - gridMinimum) / stepSize)), ivec3(0), dimensions - ivec3(1));
+
+    for (int axis = 0; axis < 3; ++axis) {
+        const float direction = ray.direction[axis];
+        if (direction > 0.0) {
+            state.step[axis] = 1;
+            const float boundary = gridMinimum[axis] + float(state.coordinate[axis] + 1) * stepSize[axis];
+            state.nextT[axis] = (boundary - ray.origin[axis]) / direction;
+            state.deltaT[axis] = stepSize[axis] / direction;
+        } else if (direction < 0.0) {
+            state.step[axis] = -1;
+            const float boundary = gridMinimum[axis] + float(state.coordinate[axis]) * stepSize[axis];
+            state.nextT[axis] = (boundary - ray.origin[axis]) / direction;
+            state.deltaT[axis] = -stepSize[axis] / direction;
+        } else {
+            state.step[axis] = 0;
+            state.nextT[axis] = kInfinity;
+            state.deltaT[axis] = kInfinity;
+        }
+    }
+
+    return state;
+}
+
+float advanceDda(inout DdaState state) {
+    const float nextBoundaryT = min(state.nextT.x, min(state.nextT.y, state.nextT.z));
+    const float tieTolerance = 1.0e-5;
+
+    if (state.nextT.x <= nextBoundaryT + tieTolerance) {
+        state.coordinate.x += state.step.x;
+        state.nextT.x += state.deltaT.x;
+    }
+    if (state.nextT.y <= nextBoundaryT + tieTolerance) {
+        state.coordinate.y += state.step.y;
+        state.nextT.y += state.deltaT.y;
+    }
+    if (state.nextT.z <= nextBoundaryT + tieTolerance) {
+        state.coordinate.z += state.step.z;
+        state.nextT.z += state.deltaT.z;
+    }
+
+    state.currentT = nextBoundaryT;
+    return nextBoundaryT;
+}
+
+uint hash32(uint value) {
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return value;
+}
+
+float random01(inout uint state) {
+    state = hash32(state + 0x9e3779b9u);
+    return float(state & 0x00ffffffu) / 16777216.0;
+}
+
+Ray generateRay(uvec2 pixel, uvec2 dimensions) {
+    Ray ray;
+    if (traversalConfig.rayMode == 0u) {
+        const vec2 normalizedPixel = (vec2(pixel) + vec2(0.5)) / vec2(dimensions);
+        const vec2 ndc = vec2(normalizedPixel.x * 2.0 - 1.0, 1.0 - normalizedPixel.y * 2.0);
+        ray.origin = pushData.cameraPosition.xyz;
+        ray.direction = normalize(pushData.cameraForward.xyz +
+                                  ndc.x * pushData.cameraRight.xyz +
+                                  ndc.y * pushData.cameraUp.xyz);
+        return ray;
+    }
+
+    uint state = hash32(pixel.x + pixel.y * dimensions.x + 0x51f15e5du);
+    const vec3 extent = vec3(pushData.gridSelected.xyz) * pushData.cellSize.xyz;
+    const vec3 originRandom = vec3(random01(state), random01(state), random01(state));
+    const vec3 targetRandom = vec3(random01(state), random01(state), random01(state));
+    ray.origin = pushData.worldMinimum.xyz + originRandom * extent;
+    ray.origin.y = pushData.worldMinimum.y + 0.5 + originRandom.y * extent.y * 0.9;
+    const vec3 target = pushData.worldMinimum.xyz + targetRandom * extent;
+    ray.direction = normalize(target - ray.origin);
+    if (dot(ray.direction, ray.direction) < 0.5) {
+        ray.direction = vec3(0.0, -1.0, 0.0);
+    }
+    return ray;
+}
+
+Hit traceBvh(Ray ray, bool debugRay, inout LocalMetrics metrics) {
+    Hit result;
+    result.t = kInfinity;
+    result.triangleIndex = 0u;
+    result.normal = vec3(0.0);
+    result.color = vec3(0.0);
+    result.found = false;
+
+    uint stackNodes[64];
+    float stackNear[64];
+    uint stackSize = 0u;
+
+    float rootNear = 0.0;
+    float rootFar = 0.0;
+    metrics.nodeTests += 1u;
+    if (intersectAabb(ray, bvhNodes[0].minimum.xyz, bvhNodes[0].maximum.xyz, result.t, rootNear, rootFar)) {
+        stackNodes[stackSize] = 0u;
+        stackNear[stackSize] = rootNear;
+        stackSize += 1u;
+    }
+
+    while (stackSize > 0u) {
+        stackSize -= 1u;
+        const uint nodeIndex = stackNodes[stackSize];
+        const float nodeNear = stackNear[stackSize];
+
+        if (nodeNear >= result.t) {
+            continue;
+        }
+
+        const BvhNode node = bvhNodes[nodeIndex];
+        recordDebug(debugRay, 0u, ray.origin + ray.direction * nodeNear, nodeNear,
+                    uvec3(nodeIndex, node.meta.w, stackSize));
+
+        if (node.meta.w > 0u) {
+            for (uint index = 0u; index < node.meta.w; ++index) {
+                const uint triangleIndex = bvhTriangleReferences[node.meta.z + index];
+                float triangleT = 0.0;
+                vec3 normal = vec3(0.0);
+                metrics.triangleTests += 1u;
+
+                if (intersectTriangle(ray, triangles[triangleIndex], result.t, triangleT, normal)) {
+                    result.t = triangleT;
+                    result.triangleIndex = triangleIndex;
+                    result.normal = normal;
+                    result.color = triangles[triangleIndex].color.xyz;
+                    result.found = true;
+                    recordDebug(debugRay, 4u, ray.origin + ray.direction * triangleT, triangleT,
+                                uvec3(triangleIndex, nodeIndex, index));
+                }
+            }
+            continue;
+        }
+
+        const uint leftIndex = node.meta.x;
+        const uint rightIndex = node.meta.y;
+        float leftNear = 0.0;
+        float leftFar = 0.0;
+        float rightNear = 0.0;
+        float rightFar = 0.0;
+
+        metrics.nodeTests += 2u;
+        const bool hitLeft = intersectAabb(ray, bvhNodes[leftIndex].minimum.xyz,
+                                           bvhNodes[leftIndex].maximum.xyz, result.t, leftNear, leftFar);
+        const bool hitRight = intersectAabb(ray, bvhNodes[rightIndex].minimum.xyz,
+                                            bvhNodes[rightIndex].maximum.xyz, result.t, rightNear, rightFar);
+
+        if (hitLeft && hitRight) {
+            const bool leftFirst = leftNear <= rightNear;
+            const uint nearIndex = leftFirst ? leftIndex : rightIndex;
+            const uint farIndex = leftFirst ? rightIndex : leftIndex;
+            const float nearDistance = leftFirst ? leftNear : rightNear;
+            const float farDistance = leftFirst ? rightNear : leftNear;
+
+            if (stackSize + 2u <= 64u) {
+                stackNodes[stackSize] = farIndex;
+                stackNear[stackSize] = farDistance;
+                stackSize += 1u;
+                stackNodes[stackSize] = nearIndex;
+                stackNear[stackSize] = nearDistance;
+                stackSize += 1u;
+            }
+        } else if (hitLeft && stackSize < 64u) {
+            stackNodes[stackSize] = leftIndex;
+            stackNear[stackSize] = leftNear;
+            stackSize += 1u;
+        } else if (hitRight && stackSize < 64u) {
+            stackNodes[stackSize] = rightIndex;
+            stackNear[stackSize] = rightNear;
+            stackSize += 1u;
+        }
+    }
+
+    if (result.found) {
+        metrics.hits = 1u;
+    }
+    metrics.maximumTraversal = metrics.nodeTests;
+    return result;
+}
+
+bool traceMicroBvh(
+    Ray ray,
+    BrickHeader header,
+    float brickEntry,
+    float brickExit,
+    bool debugRay,
+    inout LocalMetrics metrics,
+    inout Hit result) {
+    uint stackNodes[64];
+    float stackNear[64];
+    uint stackSize = 0u;
+    const float maximumT = min(result.t, brickExit + kEpsilon);
+
+    float rootNear = 0.0;
+    float rootFar = 0.0;
+    metrics.microNodeTests += 1u;
+    if (!intersectAabb(
+            ray,
+            microBvhNodes[header.nodeOffset].minimum.xyz,
+            microBvhNodes[header.nodeOffset].maximum.xyz,
+            maximumT,
+            rootNear,
+            rootFar)) {
+        return false;
+    }
+
+    stackNodes[stackSize] = header.nodeOffset;
+    stackNear[stackSize] = rootNear;
+    stackSize += 1u;
+    bool foundInBrick = false;
+
+    while (stackSize > 0u) {
+        stackSize -= 1u;
+        const uint nodeIndex = stackNodes[stackSize];
+        const float nodeNear = stackNear[stackSize];
+        if (nodeNear >= result.t || nodeNear > brickExit + kEpsilon) {
+            continue;
+        }
+
+        const BvhNode node = microBvhNodes[nodeIndex];
+        recordDebug(debugRay, 2u, ray.origin + ray.direction * nodeNear, nodeNear,
+                    uvec3(nodeIndex, node.meta.w, stackSize));
+
+        if (node.meta.w > 0u) {
+            for (uint index = 0u; index < node.meta.w; ++index) {
+                const uint triangleIndex = microTriangleReferences[node.meta.z + index];
+                float triangleT = 0.0;
+                vec3 normal = vec3(0.0);
+                metrics.triangleTests += 1u;
+                if (intersectTriangle(ray, triangles[triangleIndex], min(result.t, brickExit + kEpsilon), triangleT, normal) &&
+                    triangleT >= brickEntry - kEpsilon && triangleT <= brickExit + kEpsilon) {
+                    result.t = triangleT;
+                    result.triangleIndex = triangleIndex;
+                    result.normal = normal;
+                    result.color = triangles[triangleIndex].color.xyz;
+                    result.found = true;
+                    foundInBrick = true;
+                    recordDebug(debugRay, 4u, ray.origin + ray.direction * triangleT, triangleT,
+                                uvec3(triangleIndex, nodeIndex, index));
+                }
+            }
+            continue;
+        }
+
+        const uint leftIndex = node.meta.x;
+        const uint rightIndex = node.meta.y;
+        float leftNear = 0.0;
+        float leftFar = 0.0;
+        float rightNear = 0.0;
+        float rightFar = 0.0;
+        metrics.microNodeTests += 2u;
+        const float currentMaximum = min(result.t, brickExit + kEpsilon);
+        const bool hitLeft = intersectAabb(ray, microBvhNodes[leftIndex].minimum.xyz,
+                                           microBvhNodes[leftIndex].maximum.xyz,
+                                           currentMaximum, leftNear, leftFar);
+        const bool hitRight = intersectAabb(ray, microBvhNodes[rightIndex].minimum.xyz,
+                                            microBvhNodes[rightIndex].maximum.xyz,
+                                            currentMaximum, rightNear, rightFar);
+
+        if (hitLeft && hitRight) {
+            const bool leftFirst = leftNear <= rightNear;
+            const uint nearIndex = leftFirst ? leftIndex : rightIndex;
+            const uint farIndex = leftFirst ? rightIndex : leftIndex;
+            const float nearDistance = leftFirst ? leftNear : rightNear;
+            const float farDistance = leftFirst ? rightNear : leftNear;
+            if (stackSize + 2u <= 64u) {
+                stackNodes[stackSize] = farIndex;
+                stackNear[stackSize] = farDistance;
+                stackSize += 1u;
+                stackNodes[stackSize] = nearIndex;
+                stackNear[stackSize] = nearDistance;
+                stackSize += 1u;
+            }
+        } else if (hitLeft && stackSize < 64u) {
+            stackNodes[stackSize] = leftIndex;
+            stackNear[stackSize] = leftNear;
+            stackSize += 1u;
+        } else if (hitRight && stackSize < 64u) {
+            stackNodes[stackSize] = rightIndex;
+            stackNear[stackSize] = rightNear;
+            stackSize += 1u;
+        }
+    }
+
+    return foundInBrick;
+}
+
+void integrateVolumeSegment(
+    Ray ray,
+    BrickHeader header,
+    float segmentEntry,
+    float segmentExit,
+    bool debugRay,
+    inout LocalMetrics metrics,
+    inout vec4 volume) {
+    if (traversalConfig.workloadMode == 0u || header.volume.a <= 0.0 || segmentExit <= segmentEntry) {
+        return;
+    }
+
+    const float segmentLength = segmentExit - segmentEntry;
+    const float opticalDepth = header.volume.a * segmentLength * 0.18;
+    const float alpha = 1.0 - exp(-opticalDepth);
+    volume.rgb += volume.a * alpha * header.volume.rgb;
+    volume.a *= 1.0 - alpha;
+    metrics.volumeSamples += 1u;
+    metrics.volumeBricks += 1u;
+    const float middleT = 0.5 * (segmentEntry + segmentExit);
+    recordDebug(debugRay, 3u, ray.origin + ray.direction * middleT, middleT,
+                uvec3(floatBitsToUint(header.volume.a), metrics.volumeSamples, 0u));
+}
+
+vec4 traceVolumeOnly(Ray ray, float maximumT, bool debugRay, inout LocalMetrics metrics) {
+    vec4 volume = vec4(0.0, 0.0, 0.0, 1.0);
+    if (traversalConfig.workloadMode == 0u) {
+        return volume;
+    }
+
+    const ivec3 gridDimensions = ivec3(pushData.gridSelected.xyz);
+    const vec3 worldMinimum = pushData.worldMinimum.xyz;
+    const vec3 cellSize = pushData.cellSize.xyz;
+    const vec3 worldMaximum = worldMinimum + vec3(gridDimensions) * cellSize;
+    float worldEntry = 0.0;
+    float worldExit = 0.0;
+    if (!intersectAabb(ray, worldMinimum, worldMaximum, maximumT, worldEntry, worldExit)) {
+        return volume;
+    }
+    worldExit = min(worldExit, maximumT);
+
+    const ivec3 brickDimensions = ivec3(
+        traversalConfig.brickDimensionX,
+        traversalConfig.brickDimensionY,
+        traversalConfig.brickDimensionZ);
+    const vec3 brickWorldSize = cellSize * float(traversalConfig.brickSize);
+    DdaState brickDda = initializeDda(ray, worldEntry, worldMinimum, brickWorldSize, brickDimensions);
+
+    while (brickDda.currentT <= worldExit && insideGrid(brickDda.coordinate, brickDimensions)) {
+        metrics.brickSteps += 1u;
+        const uint brickIndex = flatten3D(brickDda.coordinate, brickDimensions);
+        const float brickExit = min(min(brickDda.nextT.x, min(brickDda.nextT.y, brickDda.nextT.z)), worldExit);
+        const BrickHeader header = brickHeaders[traversalConfig.headerOffset + brickIndex];
+        if (header.volume.a > 0.0) {
+            metrics.occupiedBricks += 1u;
+            integrateVolumeSegment(ray, header, brickDda.currentT, brickExit, debugRay, metrics, volume);
+            if (volume.a <= 0.01) {
+                break;
+            }
+        }
+        if (brickExit >= worldExit - kEpsilon) {
+            break;
+        }
+        advanceDda(brickDda);
+    }
+
+    metrics.maximumTraversal = metrics.nodeTests + metrics.brickSteps + metrics.microNodeTests;
+    return volume;
+}
+
+Hit traceVoxelHybrid(Ray ray, bool debugRay, inout LocalMetrics metrics, out vec4 volume) {
+    Hit result;
+    result.t = kInfinity;
+    result.triangleIndex = 0u;
+    result.normal = vec3(0.0);
+    result.color = vec3(0.0);
+    result.found = false;
+    volume = vec4(0.0, 0.0, 0.0, 1.0);
+
+    const ivec3 gridDimensions = ivec3(pushData.gridSelected.xyz);
+    const vec3 worldMinimum = pushData.worldMinimum.xyz;
+    const vec3 cellSize = pushData.cellSize.xyz;
+    const vec3 worldMaximum = worldMinimum + vec3(gridDimensions) * cellSize;
+
+    float worldEntry = 0.0;
+    float worldExit = 0.0;
+    if (!intersectAabb(ray, worldMinimum, worldMaximum, kInfinity, worldEntry, worldExit)) {
+        return result;
+    }
+
+    const ivec3 brickDimensions = ivec3(
+        traversalConfig.brickDimensionX,
+        traversalConfig.brickDimensionY,
+        traversalConfig.brickDimensionZ);
+    const vec3 brickWorldSize = cellSize * float(traversalConfig.brickSize);
+    DdaState brickDda = initializeDda(ray, worldEntry, worldMinimum, brickWorldSize, brickDimensions);
+
+    while (brickDda.currentT <= worldExit && insideGrid(brickDda.coordinate, brickDimensions)) {
+        metrics.brickSteps += 1u;
+        const uint brickIndex = flatten3D(brickDda.coordinate, brickDimensions);
+        const float brickExit = min(min(brickDda.nextT.x, min(brickDda.nextT.y, brickDda.nextT.z)), worldExit);
+        const BrickHeader header = brickHeaders[traversalConfig.headerOffset + brickIndex];
+
+        recordDebug(debugRay, 1u, ray.origin + ray.direction * brickDda.currentT, brickDda.currentT,
+                    uvec3(brickDda.coordinate));
+
+        const bool hasVolume = traversalConfig.workloadMode != 0u && header.volume.a > 0.0;
+        const bool hasSurface = header.nodeCount > 0u;
+        if (hasVolume || hasSurface) {
+            metrics.occupiedBricks += 1u;
+        }
+
+        bool foundInBrick = false;
+        if (hasSurface) {
+            foundInBrick = traceMicroBvh(ray, header, brickDda.currentT, brickExit, debugRay, metrics, result);
+        }
+
+        const float segmentExit = min(brickExit, result.t);
+        if (hasVolume) {
+            integrateVolumeSegment(ray, header, brickDda.currentT, segmentExit, debugRay, metrics, volume);
+        }
+
+        if (foundInBrick || volume.a <= 0.01) {
+            metrics.hits = result.found ? 1u : 0u;
+            metrics.maximumTraversal = metrics.nodeTests + metrics.brickSteps + metrics.microNodeTests;
+            return result;
+        }
+
+        if (brickExit >= worldExit - kEpsilon) {
+            break;
+        }
+        advanceDda(brickDda);
+    }
+
+    metrics.hits = result.found ? 1u : 0u;
+    metrics.maximumTraversal = metrics.nodeTests + metrics.brickSteps + metrics.microNodeTests;
+    return result;
+}
+
+vec3 heatMap(uint value, float logarithmicRange) {
+    const float normalized = clamp(log2(1.0 + float(value)) / logarithmicRange, 0.0, 1.0);
+    const float low = clamp(1.0 - normalized * 2.0, 0.0, 1.0);
+    const float high = clamp(normalized * 2.0 - 1.0, 0.0, 1.0);
+    const float middle = 1.0 - abs(normalized * 2.0 - 1.0);
+    return vec3(high, middle, low);
+}
+
+vec3 shadeHit(Hit hit, Ray ray) {
+    if (!hit.found) {
+        const float horizon = 0.5 + 0.5 * ray.direction.y;
+        return mix(vec3(0.025, 0.035, 0.055), vec3(0.18, 0.24, 0.34), horizon);
+    }
+
+    const vec3 lightDirection = normalize(vec3(-0.45, 0.8, 0.35));
+    const float diffuse = max(dot(hit.normal, lightDirection), 0.0);
+    const float facing = 0.15 + 0.85 * diffuse;
+    return hit.color * facing;
+}
+
+void main() {
+#if INSTRUMENT
+    if (gl_LocalInvocationIndex < 10u) {
+        workgroupMetrics[gl_LocalInvocationIndex] = 0u;
+    }
+    barrier();
+#endif
+
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+    const uvec2 dimensions = pushData.imageMode.xy;
+    const bool validPixel = pixel.x < dimensions.x && pixel.y < dimensions.y;
+
+    LocalMetrics metrics;
+    metrics.nodeTests = 0u;
+    metrics.brickSteps = 0u;
+    metrics.microNodeTests = 0u;
+    metrics.occupiedBricks = 0u;
+    metrics.triangleTests = 0u;
+    metrics.volumeSamples = 0u;
+    metrics.volumeBricks = 0u;
+    metrics.hits = 0u;
+    metrics.maximumTraversal = 0u;
+
+    if (validPixel) {
+        const Ray ray = generateRay(pixel, dimensions);
+        const bool debugRay = isSelectedRay(pixel);
+        Hit hit;
+        vec4 volume = vec4(0.0, 0.0, 0.0, 1.0);
+#if TRACE_BVH
+        hit = traceBvh(ray, debugRay, metrics);
+        volume = traceVolumeOnly(ray, hit.found ? hit.t : kInfinity, debugRay, metrics);
+#elif TRACE_VOXEL
+        hit = traceVoxelHybrid(ray, debugRay, metrics, volume);
+#else
+#error A traversal mode must be selected.
+#endif
+
+        vec3 outputColor;
+        switch (pushData.imageMode.z) {
+            case 1u:
+                outputColor = heatMap(metrics.triangleTests, 8.0);
+                break;
+            case 2u:
+                outputColor = heatMap(metrics.nodeTests + metrics.brickSteps + metrics.microNodeTests, 9.0);
+                break;
+            case 3u:
+                outputColor = vec3(
+                    clamp(log2(1.0 + float(metrics.triangleTests)) / 9.0, 0.0, 1.0),
+                    clamp(log2(1.0 + float(metrics.nodeTests + metrics.brickSteps + metrics.microNodeTests)) / 10.0, 0.0, 1.0),
+                    clamp(log2(1.0 + float(metrics.volumeSamples)) / 7.0, 0.0, 1.0));
+                break;
+            default:
+                outputColor = volume.rgb + volume.a * shadeHit(hit, ray);
+                break;
+        }
+
+        const uvec2 selected = selectedPixel();
+        if ((pixel.x == selected.x && abs(int(pixel.y) - int(selected.y)) <= 5) ||
+            (pixel.y == selected.y && abs(int(pixel.x) - int(selected.x)) <= 5)) {
+            outputColor = vec3(1.0, 0.2, 1.0);
+        }
+
+        imageStore(outputImage, ivec2(pixel), vec4(outputColor, 1.0));
+    }
+
+#if INSTRUMENT
+    atomicAdd(workgroupMetrics[0], validPixel ? 1u : 0u);
+    atomicAdd(workgroupMetrics[1], metrics.nodeTests);
+    atomicAdd(workgroupMetrics[2], metrics.brickSteps);
+    atomicAdd(workgroupMetrics[3], metrics.microNodeTests);
+    atomicAdd(workgroupMetrics[4], metrics.occupiedBricks);
+    atomicAdd(workgroupMetrics[5], metrics.triangleTests);
+    atomicAdd(workgroupMetrics[6], metrics.volumeSamples);
+    atomicAdd(workgroupMetrics[7], metrics.volumeBricks);
+    atomicAdd(workgroupMetrics[8], metrics.hits);
+    atomicMax(workgroupMetrics[9], metrics.maximumTraversal);
+
+    barrier();
+    if (gl_LocalInvocationIndex < 9u) {
+        atomicAdd(metricValues[gl_LocalInvocationIndex], workgroupMetrics[gl_LocalInvocationIndex]);
+    } else if (gl_LocalInvocationIndex == 9u) {
+        atomicMax(metricValues[9], workgroupMetrics[9]);
+    }
+#endif
+}

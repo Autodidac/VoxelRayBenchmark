@@ -1,0 +1,53 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "epoch-voxel-hybrid-benchmark",
+  "version-string": "0.5.2",
+  "description": "SDL3 Vulkan/OpenGL compute benchmark comparing global triangle BVH traversal with sparse brick DDA plus exact brick-local micro-BVHs.",
+  "dependencies": [
+    {
+      "name": "sdl3",
+      "default-features": false,
+      "features": [
+        "vulkan"
+      ],
+      "platform": "windows"
+    },
+    {
+      "name": "sdl3",
+      "default-features": false,
+      "features": [
+        "vulkan",
+        "wayland",
+        "x11"
+      ],
+      "platform": "linux"
+    },
+    {
+      "name": "glad",
+      "default-features": false,
+      "features": [
+        "gl-api-43",
+        "loader"
+      ]
+    },
+    "opengl",
+    "vulkan-headers",
+    {
+      "name": "vulkan-loader",
+      "platform": "windows"
+    },
+    {
+      "name": "vulkan-loader",
+      "features": [
+        "wayland",
+        "xcb",
+        "xlib"
+      ],
+      "platform": "linux"
+    },
+    {
+      "name": "shaderc",
+      "host": true
+    }
+  ]
+}
