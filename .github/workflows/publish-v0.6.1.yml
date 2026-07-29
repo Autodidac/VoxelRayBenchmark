@@ -19,36 +19,31 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check bootstrap payload
-        id: bootstrap
+      - name: Verify bootstrap trigger
         shell: bash
-        run: |
-          if [[ -f .release-bootstrap/manifest.txt ]]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
+        run: test -f .release-bootstrap/manifest.txt
 
-      - name: Reconstruct verified archive
-        if: steps.bootstrap.outputs.present == 'true'
+      - name: Reconstruct and verify source archive
         shell: bash
         run: |
           set -euo pipefail
-          cat .release-bootstrap/part-* | base64 --decode > "$RUNNER_TEMP/epoch_voxel_live_ray_inspector_child_v061.zip"
-          cp .release-bootstrap/epoch_voxel_live_ray_inspector_child_v061.zip.sha256 "$RUNNER_TEMP/"
-          cd "$RUNNER_TEMP"
-          sha256sum -c epoch_voxel_live_ray_inspector_child_v061.zip.sha256
+          cat .release-bootstrap/source-part-* \
+            | base64 --decode \
+            > "$RUNNER_TEMP/v061-source.tar.xz"
+          echo "7c2a7833123d7b6eeb9821f568bd098e311b60128b6fc72e506bf9c7f11dc129  $RUNNER_TEMP/v061-source.tar.xz" \
+            | sha256sum -c -
 
-      - name: Materialize source tree
-        if: steps.bootstrap.outputs.present == 'true'
+      - name: Materialize complete source tree
         shell: bash
         run: |
           set -euo pipefail
           rm -rf "$RUNNER_TEMP/unpacked"
           mkdir -p "$RUNNER_TEMP/unpacked"
-          unzip -q "$RUNNER_TEMP/epoch_voxel_live_ray_inspector_child_v061.zip" -d "$RUNNER_TEMP/unpacked"
+          tar -xJf "$RUNNER_TEMP/v061-source.tar.xz" -C "$RUNNER_TEMP/unpacked"
           source_root="$RUNNER_TEMP/unpacked/epoch_voxel_live_ray_inspector_child_v061"
           test -f "$source_root/CMakeLists.txt"
+          test -f "$source_root/src/main_vulkan.cpp"
+          test -f "$source_root/src/ray_inspector.cpp"
           rsync -a --delete \
             --exclude '.git/' \
             --exclude '.github/' \
@@ -56,7 +51,6 @@ jobs:
           rm -rf .release-bootstrap
 
       - name: Commit complete v0.6.1 source
-        if: steps.bootstrap.outputs.present == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -66,8 +60,22 @@ jobs:
           git commit -m "Publish VoxelRayBenchmark v0.6.1"
           git push origin HEAD:main
 
+      - name: Package release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/VoxelRayBenchmark-v0.6.1"
+          mkdir -p "$release_dir"
+          rsync -a \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            ./ "$release_dir/"
+          cd "$RUNNER_TEMP"
+          zip -qr VoxelRayBenchmark-v0.6.1-source.zip VoxelRayBenchmark-v0.6.1
+          sha256sum VoxelRayBenchmark-v0.6.1-source.zip \
+            > VoxelRayBenchmark-v0.6.1-source.zip.sha256
+
       - name: Create GitHub release
-        if: steps.bootstrap.outputs.present == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -75,24 +83,24 @@ jobs:
           set -euo pipefail
           release_sha="$(git rev-parse HEAD)"
           {
-            echo "Standalone C++23 Vulkan/OpenGL compute benchmark for global BVH versus unified brick DDA and brick-local micro-BVH traversal."
+            echo "Standalone C++23 Vulkan/OpenGL compute benchmark comparing global BVH traversal with unified brick DDA and brick-local micro-BVH traversal."
             echo
             cat CHANGES_0.6.1.md
             echo
             echo "## Validation note"
             echo
-            echo "The package passed the documented source, syntax, link, archive-integrity, and shader-isolation checks. Native Windows MSVC/Vulkan runtime validation remains hardware-dependent."
+            echo "The published source archive was reconstructed from SHA-256-verified repository payload data. Native Windows MSVC/Vulkan runtime validation remains hardware-dependent."
           } > "$RUNNER_TEMP/release-notes.md"
 
           if gh release view v0.6.1 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload v0.6.1 \
-              "$RUNNER_TEMP/epoch_voxel_live_ray_inspector_child_v061.zip" \
-              "$RUNNER_TEMP/epoch_voxel_live_ray_inspector_child_v061.zip.sha256" \
+              "$RUNNER_TEMP/VoxelRayBenchmark-v0.6.1-source.zip" \
+              "$RUNNER_TEMP/VoxelRayBenchmark-v0.6.1-source.zip.sha256" \
               --repo "$GITHUB_REPOSITORY" --clobber
           else
             gh release create v0.6.1 \
-              "$RUNNER_TEMP/epoch_voxel_live_ray_inspector_child_v061.zip" \
-              "$RUNNER_TEMP/epoch_voxel_live_ray_inspector_child_v061.zip.sha256" \
+              "$RUNNER_TEMP/VoxelRayBenchmark-v0.6.1-source.zip" \
+              "$RUNNER_TEMP/VoxelRayBenchmark-v0.6.1-source.zip.sha256" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$release_sha" \
               --title "VoxelRayBenchmark v0.6.1" \
