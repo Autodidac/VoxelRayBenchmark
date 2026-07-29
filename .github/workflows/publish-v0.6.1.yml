@@ -1,0 +1,100 @@
+name: Publish v0.6.1
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.release-bootstrap/manifest.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check bootstrap payload
+        id: bootstrap
+        shell: bash
+        run: |
+          if [[ -f .release-bootstrap/manifest.txt ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Reconstruct verified archive
+        if: steps.bootstrap.outputs.present == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .release-bootstrap/part-* | base64 --decode > "$RUNNER_TEMP/epoch_voxel_live_ray_inspector_child_v061.zip"
+          cp .release-bootstrap/epoch_voxel_live_ray_inspector_child_v061.zip.sha256 "$RUNNER_TEMP/"
+          cd "$RUNNER_TEMP"
+          sha256sum -c epoch_voxel_live_ray_inspector_child_v061.zip.sha256
+
+      - name: Materialize source tree
+        if: steps.bootstrap.outputs.present == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/unpacked"
+          mkdir -p "$RUNNER_TEMP/unpacked"
+          unzip -q "$RUNNER_TEMP/epoch_voxel_live_ray_inspector_child_v061.zip" -d "$RUNNER_TEMP/unpacked"
+          source_root="$RUNNER_TEMP/unpacked/epoch_voxel_live_ray_inspector_child_v061"
+          test -f "$source_root/CMakeLists.txt"
+          rsync -a --delete \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            "$source_root/" ./
+          rm -rf .release-bootstrap
+
+      - name: Commit complete v0.6.1 source
+        if: steps.bootstrap.outputs.present == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Publish VoxelRayBenchmark v0.6.1"
+          git push origin HEAD:main
+
+      - name: Create GitHub release
+        if: steps.bootstrap.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_sha="$(git rev-parse HEAD)"
+          {
+            echo "Standalone C++23 Vulkan/OpenGL compute benchmark for global BVH versus unified brick DDA and brick-local micro-BVH traversal."
+            echo
+            cat CHANGES_0.6.1.md
+            echo
+            echo "## Validation note"
+            echo
+            echo "The package passed the documented source, syntax, link, archive-integrity, and shader-isolation checks. Native Windows MSVC/Vulkan runtime validation remains hardware-dependent."
+          } > "$RUNNER_TEMP/release-notes.md"
+
+          if gh release view v0.6.1 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload v0.6.1 \
+              "$RUNNER_TEMP/epoch_voxel_live_ray_inspector_child_v061.zip" \
+              "$RUNNER_TEMP/epoch_voxel_live_ray_inspector_child_v061.zip.sha256" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create v0.6.1 \
+              "$RUNNER_TEMP/epoch_voxel_live_ray_inspector_child_v061.zip" \
+              "$RUNNER_TEMP/epoch_voxel_live_ray_inspector_child_v061.zip.sha256" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$release_sha" \
+              --title "VoxelRayBenchmark v0.6.1" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
