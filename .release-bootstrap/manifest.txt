@@ -1,0 +1,4 @@
+version=v0.6.1
+archive=v061-source.tar.xz
+sha256=7c2a7833123d7b6eeb9821f568bd098e311b60128b6fc72e506bf9c7f11dc129
+chunks=25
